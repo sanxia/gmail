@@ -1,6 +1,7 @@
 package gmail
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/smtp"
@@ -20,6 +21,7 @@ type (
 
 	mailService struct {
 		Config *MailConfig
+		Auth   smtp.Auth
 	}
 
 	MailConfig struct {
@@ -27,6 +29,7 @@ type (
 		Port     int32  `form:"port" json:"port"`
 		Username string `form:"username" json:"username"`
 		Password string `form:"password" json:"password"`
+		IsSsl    bool   `form:"is_ssl" json:"is_ssl"`
 	}
 
 	Email struct {
@@ -38,11 +41,12 @@ type (
 )
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- * 创建邮件发送客户端
+ * 初始化邮件发送客户端
  * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 func NewMailClient(config *MailConfig) MailClient {
 	mService := &mailService{
 		Config: config,
+		Auth:   smtp.PlainAuth("", config.Username, config.Password, config.Host),
 	}
 
 	if mService.Config.Port == 0 {
@@ -56,16 +60,28 @@ func NewMailClient(config *MailConfig) MailClient {
  * 发送邮件
  * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 func (s *mailService) Send(email *Email) error {
-	smtpAddr := s.Config.Host + ":" + fmt.Sprintf("%d", s.Config.Port)
-	plainAuth := smtp.PlainAuth("", s.Config.Username, s.Config.Password, s.Config.Host)
+	var err error
+	if s.Config.IsSsl {
+		err = s.sendSslMail(email)
+	} else {
+		err = s.sendMail(email)
+	}
 
+	return err
+}
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ * 发送邮件
+ * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+func (s *mailService) sendMail(email *Email) error {
 	header := s.getMailHeader(email)
 	content := header + "\r\n" + email.Content
+	smtpAddr := s.Config.Host + ":" + fmt.Sprintf("%d", s.Config.Port)
 
 	//发送邮件
 	err := smtp.SendMail(
 		smtpAddr,
-		plainAuth,
+		s.Auth,
 		s.Config.Username,
 		email.To,
 		[]byte(content),
@@ -76,6 +92,64 @@ func (s *mailService) Send(email *Email) error {
 	}
 
 	return err
+}
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ * 发送Ssl邮件
+ * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+func (s *mailService) sendSslMail(email *Email) error {
+	header := s.getMailHeader(email)
+	content := header + "\r\n" + email.Content
+	smtpAddr := s.Config.Host + ":" + fmt.Sprintf("%d", s.Config.Port)
+
+	tlsconfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         s.Config.Host,
+	}
+
+	conn, err := tls.Dial("tcp", smtpAddr, tlsconfig)
+	if err != nil {
+		return fmt.Errorf("tls dial error:%v", err)
+	}
+
+	smtpClient, err := smtp.NewClient(conn, s.Config.Host)
+	if err != nil {
+		return fmt.Errorf("smtp client error: %v", err)
+	}
+	defer smtpClient.Close()
+
+	if s.Auth != nil {
+		if ok, _ := smtpClient.Extension("AUTH"); ok {
+			if err = smtpClient.Auth(s.Auth); err != nil {
+				return fmt.Errorf("smtp client auth error: %v", err)
+			}
+		}
+	}
+
+	if err := smtpClient.Mail(s.Config.Username); err != nil {
+		return fmt.Errorf("smtp client mail error: %v", err)
+	}
+
+	for _, toUser := range email.To {
+		if err = smtpClient.Rcpt(toUser); err != nil {
+			return fmt.Errorf("smtp client rcpt error: %v", err)
+		}
+	}
+
+	w, err := smtpClient.Data()
+	if err != nil {
+		return fmt.Errorf("smtp client data error: %v", err)
+	}
+
+	if _, err := w.Write([]byte(content)); err != nil {
+		return fmt.Errorf("smtp client write body error: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("smtp client close body error:%v", err)
+	}
+
+	return smtpClient.Quit()
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
